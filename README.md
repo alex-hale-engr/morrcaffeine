@@ -1,6 +1,6 @@
 # morrccaffeine.ps1
 
-## Based on https://www.zhornsoftware.co.uk/caffeine/ which was blocked at a corporate level, but I could still run a powershell script.  I wanted more randomness and flexibility in duration, didn't need a GUI, and I wanted it to be able to run forever in the background on its own without requiring me to physically start it every day.
+## Based on https://www.zhornsoftware.co.uk/caffeine/ which was blocked at a corporate level, but I could still run a powershell script.  I wanted more randomness and flexibility in duration, didn't need a GUI, and I wanted it to be able to run forever in the background on its own without requiring me to manually execute every day.  While the script is running, Windows is instructed not to trigger idle sleep or idle display lock. When the script exits, normal system behavior immediately resumes.
 
 ## Overview
 morrccaffeine.ps1 is a randomized F13 keep-alive script for Windows. It periodically sends an F13 keypress to prevent idle or lock behavior.
