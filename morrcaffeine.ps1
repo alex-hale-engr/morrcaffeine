@@ -207,6 +207,51 @@ if ($MaxDurationMinutes -lt $MinDurationMinutes) { throw "MaxDurationMinutes mus
 if ($IntervalSeconds -le 0) { throw "IntervalSeconds must be > 0." }
 if ($windowEndSpan -lt $windowStartSpan) { throw "StartWindowEnd must be later than StartWindowStart (same day window)." }
 
+
+# --- No-lock (no keyboard/mouse input) ---
+# Uses SetThreadExecutionState to prevent idle sleep/display-off while this script is running.
+# This is independent of the F13 keypress scheduling.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class ExecState {
+  [DllImport("kernel32.dll")]
+  public static extern uint SetThreadExecutionState(uint esFlags);
+
+  public const uint ES_CONTINUOUS = 0x80000000;
+  public const uint ES_SYSTEM_REQUIRED = 0x00000001;
+  public const uint ES_DISPLAY_REQUIRED = 0x00000002;
+}
+"@ | Out-Null
+
+function Enable-NoLock {
+    [ExecState]::SetThreadExecutionState([ExecState]::ES_CONTINUOUS -bor [ExecState]::ES_SYSTEM_REQUIRED -bor [ExecState]::ES_DISPLAY_REQUIRED) | Out-Null
+}
+
+function Disable-NoLock {
+    [ExecState]::SetThreadExecutionState([ExecState]::ES_CONTINUOUS) | Out-Null
+}
+
+# Re-assert periodically to keep Windows honest (some environments can clear the state).
+$script:noLockTimer = New-Object System.Timers.Timer
+$script:noLockTimer.Interval = 30000
+Register-ObjectEvent -InputObject $script:noLockTimer -EventName Elapsed -Action { Enable-NoLock } | Out-Null
+$script:noLockTimer.Start()
+
+# Enable immediately as soon as the script begins its main execution.
+Enable-NoLock
+
+# Ensure we revert when PowerShell exits.
+Register-EngineEvent PowerShell.Exiting -Action {
+    try {
+        Disable-NoLock
+        if ($script:noLockTimer) {
+            $script:noLockTimer.Stop()
+            $script:noLockTimer.Dispose()
+        }
+    } catch {}
+} | Out-Null
+
 $wshell = New-Object -ComObject WScript.Shell
 
 # Immediate run on launch
