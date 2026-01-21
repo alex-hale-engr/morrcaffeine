@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-# Usage:
-#   python3 morrcaffeine_macos.py --start-window-start 08:30 --start-window-end 10:00 --days-of-week Mon,Tue,Wed,Thu,Fri --min-duration-minutes 120 --max-duration-minutes 240 --interval-seconds 60
-#
-# What it does:
-# - Starts a macOS no-lock mechanism immediately (caffeinate) and keeps it active for as long as this script runs.
-# - Runs an immediate F13 session on launch (random duration in range).
-# - Then schedules future F13 sessions:
-#   - Random start time inside a daily time window
-#   - Only on specified weekdays
-#   - Random duration in range
-# - During an F13 session, it sends F13 at a fixed interval using osascript/System Events.
-# - Shows a live countdown progress line for sessions and waiting.
-# - Interactive controls:
-#   - Press E to end the current F13 session early (no-lock remains active)
-#   - Press Q to quit the script (and stop no-lock)
-#
-# Notes:
-# - No-lock is implemented via /usr/bin/caffeinate (IOKit power assertion). This does NOT generate keyboard/mouse input.
-# - Sending F13 requires macOS permissions:
-#   - System Settings -> Privacy & Security -> Accessibility: allow your terminal app (Terminal/iTerm2)
-#   - System Settings -> Privacy & Security -> Automation: allow your terminal app to control "System Events" (prompted on first run)
-# - Time windows do not cross midnight (end must be later than start on the same day).
+"""
+morrcaffeine_macos.py
+
+macOS port of the Windows morrcaffeine behavior:
+
+- Always-on "no-lock" while the script runs (via /usr/bin/caffeinate).
+- F13 scheduling behavior:
+  * Run immediately on launch for a random duration between min/max.
+  * Then schedule future sessions on selected weekdays:
+      - Random start time inside a daily window
+      - Random duration in range
+      - Send F13 every N seconds during sessions
+
+Controls (terminal must have focus):
+- E : end current F13 session early (no-lock continues)
+- Q : quit script (stops no-lock)
+
+Notes:
+- Sending F13 uses osascript/System Events (key code 105) and requires:
+  * Privacy & Security -> Accessibility: allow your terminal app
+  * Privacy & Security -> Automation: allow your terminal app to control "System Events"
+"""
 
 import argparse
 import datetime as dt
@@ -33,6 +33,8 @@ import sys
 import termios
 import tty
 import atexit
+import shutil
+
 
 DAY_MAP = {
     "mon": "Mon",
@@ -54,13 +56,22 @@ DOW_ABBREV = {
     6: "Sun",
 }
 
-F13_KEYCODE = 105  # macOS "key code" for F13 in System Events
+F13_KEYCODE = 105  # macOS System Events key code for F13
+
+
+def is_tty():
+    try:
+        return sys.stdout.isatty() and sys.stdin.isatty()
+    except Exception:
+        return False
 
 
 class RawTerminal:
+    """cbreak mode for single-key reads + optional terminal state toggles."""
     def __init__(self):
         self._fd = None
         self._old = None
+        self._wrap_disabled = False
 
     def __enter__(self):
         if not sys.stdin.isatty():
@@ -68,109 +79,148 @@ class RawTerminal:
         self._fd = sys.stdin.fileno()
         self._old = termios.tcgetattr(self._fd)
         tty.setcbreak(self._fd)
+
+        # Disable auto-wrap (prevents progress redraws from "spilling" into new lines).
+        # Restore on exit.
+        try:
+            sys.stdout.write("\033[?7l")  # DECAWM off
+            sys.stdout.flush()
+            self._wrap_disabled = True
+        except Exception:
+            self._wrap_disabled = False
+
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        # Restore auto-wrap if we disabled it
+        if self._wrap_disabled:
+            try:
+                sys.stdout.write("\033[?7h")  # DECAWM on
+                sys.stdout.flush()
+            except Exception:
+                pass
+
         if self._fd is not None and self._old is not None:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
 
 
-def normalize_days(days_csv: str):
+def normalize_days(days_csv):
     parts = [p.strip() for p in days_csv.split(",") if p.strip()]
     normalized = []
     for p in parts:
-        key = p.strip().lower()
-        if len(key) >= 3:
-            key = key[:3]
+        key = p.lower()[:3]
         if key in DAY_MAP:
             normalized.append(DAY_MAP[key])
     if not normalized:
-        raise ValueError("DaysOfWeek is empty or invalid. Use values like Mon,Tue,Wed,Thu,Fri,Sat,Sun.")
+        raise ValueError("DaysOfWeek is empty or invalid. Use Mon,Tue,Wed,Thu,Fri,Sat,Sun.")
     return normalized
 
 
-def parse_time_of_day(hhmm: str) -> dt.time:
-    # Accepts H:MM, HH:MM, optionally seconds
+def parse_time_of_day(s):
     for fmt in ("%H:%M", "%H:%M:%S"):
         try:
-            return dt.datetime.strptime(hhmm, fmt).time()
+            return dt.datetime.strptime(s, fmt).time()
         except ValueError:
-            continue
-    # Also allow single-digit hour like 8:30 via %H:%M already supports it, but keep this message explicit.
-    raise ValueError("Invalid time format. Use HH:MM or HH:MM:SS.")
+            pass
+    raise ValueError("Invalid time format. Use HH:MM or HH:MM:SS (e.g., 08:30).")
 
 
-def day_abbrev(date_obj: dt.date) -> str:
-    return DOW_ABBREV[date_obj.weekday()]
+def day_abbrev(d):
+    return DOW_ABBREV[d.weekday()]
 
 
-def dt_to_str(x: dt.datetime) -> str:
+def dt_to_str(x):
     return x.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def format_hhmmss(seconds: int) -> str:
+def format_hhmmss(seconds):
     if seconds < 0:
         seconds = 0
-    td = dt.timedelta(seconds=seconds)
-    total = int(td.total_seconds())
+    total = int(seconds)
     hh = total // 3600
     mm = (total % 3600) // 60
     ss = total % 60
-    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+    return "%02d:%02d:%02d" % (hh, mm, ss)
 
 
-def print_progress_line(activity: str, status: str, percent: int | None):
-    # Single-line, overwrite in-place
-    if percent is None:
-        bar = ""
+def _term_cols():
+    try:
+        return shutil.get_terminal_size(fallback=(80, 20)).columns
+    except Exception:
+        return 80
+
+
+def print_progress_line(mode, remaining_seconds, percent):
+    """
+    Robust single-line progress display:
+    - Clears the current line
+    - Writes a short status that is always truncated to the terminal width
+    - Never prints newlines
+    """
+    if not sys.stdout.isatty():
+        return
+
+    cols = _term_cols()
+    if cols is None or cols < 20:
+        cols = 80
+
+    # Keep it deliberately short to avoid wrapping in narrow terminals.
+    # Examples:
+    #   RUN  06:03:50  [####------] 40%
+    #   WAIT 10:19:05  (2026-01-22 08:47:12)
+    if mode == "RUN":
+        bar_width = 12
+        done = int((percent / 100.0) * bar_width)
+        done = max(0, min(done, bar_width))
+        bar = "[" + ("#" * done) + ("-" * (bar_width - done)) + "]"
+        line = "RUN  %s  %s %3d%%" % (format_hhmmss(remaining_seconds), bar, percent)
     else:
-        width = 24
-        done = int((percent / 100) * width)
-        if done < 0:
-            done = 0
-        if done > width:
-            done = width
-        bar = "[" + ("#" * done) + ("-" * (width - done)) + f"] {percent:3d}%  "
+        # WAIT mode: remaining only; the caller prints the absolute start time once.
+        line = "WAIT %s" % format_hhmmss(remaining_seconds)
 
-    line = f"{activity}: {status} {bar}"
-    # Pad to clear previous content
-    if len(line) < 120:
-        line = line + (" " * (120 - len(line)))
-    sys.stdout.write("\r" + line)
+    # Truncate aggressively: writing exactly the last column can still wrap in some terminals.
+    max_len = max(10, cols - 2)
+    if len(line) > max_len:
+        line = line[:max_len]
+
+    # CR + clear entire line + write
+    sys.stdout.write("\r\033[2K" + line)
     sys.stdout.flush()
 
 
 def clear_progress_line():
-    sys.stdout.write("\r" + (" " * 140) + "\r")
+    if not sys.stdout.isatty():
+        return
+    sys.stdout.write("\r\033[2K")
     sys.stdout.flush()
 
 
 def read_key_nonblocking():
-    # Returns uppercase char if available; else None.
+    """Return a single uppercase char if available, else None."""
     if not sys.stdin.isatty():
         return None
     r, _, _ = select.select([sys.stdin], [], [], 0)
-    if r:
-        ch = os.read(sys.stdin.fileno(), 1)
-        if not ch:
-            return None
-        try:
-            return ch.decode("utf-8", errors="ignore").upper()
-        except Exception:
-            return None
-    return None
+    if not r:
+        return None
+    ch = os.read(sys.stdin.fileno(), 1)
+    if not ch:
+        return None
+    try:
+        return ch.decode("utf-8", errors="ignore").upper()
+    except Exception:
+        return None
 
 
 def start_caffeinate():
     caffeinate_path = "/usr/bin/caffeinate"
     if not os.path.exists(caffeinate_path):
-        raise RuntimeError("ERROR: /usr/bin/caffeinate not found. This script requires macOS.")
-    # -d: prevent display sleep
-    # -i: prevent idle system sleep
-    # -s: prevent sleep while on AC power
-    # -m: prevent disk idle sleep
-    proc = subprocess.Popen([caffeinate_path, "-d", "-i", "-s", "-m"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return proc
+        raise RuntimeError("/usr/bin/caffeinate not found. This script requires macOS.")
+    # -d prevent display sleep, -i prevent idle system sleep, -s prevent sleep on AC, -m prevent disk idle sleep
+    return subprocess.Popen(
+        [caffeinate_path, "-d", "-i", "-s", "-m"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def stop_process(proc):
@@ -178,9 +228,6 @@ def stop_process(proc):
         return
     try:
         proc.terminate()
-    except Exception:
-        pass
-    try:
         proc.wait(timeout=2)
     except Exception:
         try:
@@ -190,24 +237,17 @@ def stop_process(proc):
 
 
 def send_f13():
-    # Uses System Events. Requires Accessibility + Automation permissions.
-    # AppleScript: tell application "System Events" to key code 105
-    try:
-        subprocess.run(
-            ["/usr/bin/osascript", "-e", f'tell application "System Events" to key code {F13_KEYCODE}'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except Exception:
-        # If osascript itself fails, ignore; user will notice by behavior.
-        pass
+    # Requires Accessibility + Automation ("System Events") permissions for the terminal app.
+    subprocess.run(
+        ["/usr/bin/osascript", "-e", 'tell application "System Events" to key code %d' % F13_KEYCODE],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
 
-def get_random_datetime_in_window(day_date: dt.date, earliest_allowed: dt.datetime, window_start: dt.datetime, window_end: dt.datetime):
-    min_start = window_start
-    if earliest_allowed > min_start:
-        min_start = earliest_allowed
+def get_random_datetime_in_window(earliest_allowed, window_start, window_end):
+    min_start = window_start if window_start > earliest_allowed else earliest_allowed
     if min_start > window_end:
         return None
     span_seconds = int((window_end - min_start).total_seconds())
@@ -217,83 +257,83 @@ def get_random_datetime_in_window(day_date: dt.date, earliest_allowed: dt.dateti
     return min_start + dt.timedelta(seconds=offset)
 
 
-def get_next_session_start(win_start: dt.time, win_end: dt.time, allowed_days: list[str]):
+def get_next_session_start(win_start, win_end, allowed_days):
     now = dt.datetime.now()
     # Search today + next 14 days
     for i in range(14):
-        candidate_day = (now.date() + dt.timedelta(days=i))
-        if day_abbrev(candidate_day) not in allowed_days:
+        day = now.date() + dt.timedelta(days=i)
+        if day_abbrev(day) not in allowed_days:
             continue
 
-        window_start = dt.datetime.combine(candidate_day, win_start)
-        window_end = dt.datetime.combine(candidate_day, win_end)
+        ws = dt.datetime.combine(day, win_start)
+        we = dt.datetime.combine(day, win_end)
+        if we < ws:
+            raise ValueError("StartWindowEnd must be later than StartWindowStart (time windows do not cross midnight).")
 
-        if window_end < window_start:
-            raise ValueError("StartWindowEnd must be later than StartWindowStart (same day window).")
-
-        earliest = dt.datetime.combine(candidate_day, dt.time.min)
-        if i == 0:
-            earliest = now
-
-        candidate = get_random_datetime_in_window(candidate_day, earliest, window_start, window_end)
+        earliest = now if i == 0 else dt.datetime.combine(day, dt.time.min)
+        candidate = get_random_datetime_in_window(earliest, ws, we)
         if candidate is not None:
             return candidate
 
-    raise RuntimeError("Could not find a valid next start time. Check your weekday list and time window.")
+    raise RuntimeError("Could not find a valid next session start. Check days and time window.")
 
 
-def run_session(min_minutes: int, max_minutes: int, interval_seconds: int):
-    duration_minutes = random.randint(min_minutes, max_minutes)
-    start_time = dt.datetime.now()
-    end_time = start_time + dt.timedelta(minutes=duration_minutes)
-    total_seconds = int((end_time - start_time).total_seconds())
+def run_session(min_minutes, max_minutes, interval_seconds, progress_tick_seconds):
+    duration = random.randint(min_minutes, max_minutes)
+    start = dt.datetime.now()
+    end = start + dt.timedelta(minutes=duration)
+    total = int((end - start).total_seconds())
 
-    print(f"Session started: {dt_to_str(start_time)} | Duration: {duration_minutes} minutes | Ends: {dt_to_str(end_time)}")
-    print("Controls while running: [E] end session early, [Q] quit script")
+    print("Session started: %s | Duration: %d minutes | Ends: %s" % (dt_to_str(start), duration, dt_to_str(end)))
+    print("Controls while running: [E] end session early, [Q] quit")
 
     next_send = dt.datetime.now()
+    next_progress = dt.datetime.now()
 
     while True:
         now = dt.datetime.now()
-        if now >= end_time:
+        if now >= end:
             break
 
         key = read_key_nonblocking()
         if key == "Q":
-            print("\nQuit requested.")
+            clear_progress_line()
+            print("\nExiting.")
             sys.exit(0)
         if key == "E":
-            print("\nEnding current session early. Waiting for next scheduled run.")
+            clear_progress_line()
+            print("\nEnding current session early. Waiting for next scheduled session.")
             break
 
         if now >= next_send:
             send_f13()
             next_send = now + dt.timedelta(seconds=interval_seconds)
 
-        remaining_seconds = int((end_time - now).total_seconds())
-        if remaining_seconds < 0:
-            remaining_seconds = 0
-        elapsed_seconds = total_seconds - remaining_seconds
-        if elapsed_seconds < 0:
-            elapsed_seconds = 0
-        if elapsed_seconds > total_seconds:
-            elapsed_seconds = total_seconds
+        if now >= next_progress:
+            remaining = int((end - now).total_seconds())
+            if remaining < 0:
+                remaining = 0
+            elapsed = total - remaining
+            if elapsed < 0:
+                elapsed = 0
+            if elapsed > total:
+                elapsed = total
+            percent = int((elapsed * 100) / total) if total > 0 else 0
 
-        percent = 0
-        if total_seconds > 0:
-            percent = int((elapsed_seconds * 100) / total_seconds)
+            print_progress_line("RUN", remaining, percent)
+            next_progress = now + dt.timedelta(seconds=progress_tick_seconds)
 
-        print_progress_line("F13 session running", f"Remaining: {format_hhmmss(remaining_seconds)}", percent)
-        # Match the Windows script's feel (fast progress updates) without burning CPU
-        time_slice = 0.25
-        select.select([], [], [], time_slice)
+        # small sleep to avoid busy looping, while staying responsive to keypresses
+        select.select([], [], [], 0.10)
 
     clear_progress_line()
-    print(f"Session ended: {dt_to_str(dt.datetime.now())}")
+    print("Session ended: %s" % dt_to_str(dt.datetime.now()))
 
 
-def wait_until(next_start: dt.datetime):
-    print(f"Next session starts at: {dt_to_str(next_start)}")
+def wait_until(next_start, progress_tick_seconds):
+    print("Next session starts at: %s" % dt_to_str(next_start))
+    next_progress = dt.datetime.now()
+
     while True:
         now = dt.datetime.now()
         if now >= next_start:
@@ -301,34 +341,40 @@ def wait_until(next_start: dt.datetime):
 
         key = read_key_nonblocking()
         if key == "Q":
-            print("\nQuit requested.")
+            clear_progress_line()
+            print("\nExiting.")
             sys.exit(0)
 
-        remaining_seconds = int((next_start - now).total_seconds())
-        if remaining_seconds < 0:
-            remaining_seconds = 0
+        if now >= next_progress:
+            remaining = int((next_start - now).total_seconds())
+            if remaining < 0:
+                remaining = 0
+            print_progress_line("WAIT", remaining, 0)
+            next_progress = now + dt.timedelta(seconds=progress_tick_seconds)
 
-        status = f"Starts at {dt_to_str(next_start)} (in {format_hhmmss(remaining_seconds)})"
-        print_progress_line("Waiting for next scheduled session", status, None)
-        select.select([], [], [], 1.0)
+        select.select([], [], [], 0.20)
 
     clear_progress_line()
 
 
 def main():
-    parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("--start-window-start", default="08:30", help="Start of daily randomized start window (HH:MM or HH:MM:SS).")
-    parser.add_argument("--start-window-end", default="10:00", help="End of daily randomized start window (HH:MM or HH:MM:SS).")
-    parser.add_argument("--days-of-week", default="Mon,Tue,Wed,Thu,Fri", help="Comma-separated: Mon,Tue,Wed,Thu,Fri,Sat,Sun")
-    parser.add_argument("--min-duration-minutes", type=int, default=240, help="Minimum session duration (minutes).")
-    parser.add_argument("--max-duration-minutes", type=int, default=480, help="Maximum session duration (minutes).")
-    parser.add_argument("--interval-seconds", type=int, default=60, help="How often to send F13 during a session.")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--start-window-start", default="08:30")
+    p.add_argument("--start-window-end", default="10:00")
+    p.add_argument("--days-of-week", default="Mon,Tue,Wed,Thu,Fri")
+    p.add_argument("--min-duration-minutes", type=int, default=240)
+    p.add_argument("--max-duration-minutes", type=int, default=480)
+    p.add_argument("--interval-seconds", type=int, default=60)
+    p.add_argument("--progress-tick-seconds", type=int, default=1, help="How often to refresh the progress display (seconds). Default 1.")
+    args = p.parse_args()
 
     win_start = parse_time_of_day(args.start_window_start)
     win_end = parse_time_of_day(args.start_window_end)
-    if dt.datetime.combine(dt.date.today(), win_end) < dt.datetime.combine(dt.date.today(), win_start):
-        raise ValueError("StartWindowEnd must be later than StartWindowStart (same day window).")
+
+    # Validate same-day window (no midnight crossing)
+    today = dt.date.today()
+    if dt.datetime.combine(today, win_end) < dt.datetime.combine(today, win_start):
+        raise ValueError("StartWindowEnd must be later than StartWindowStart (time windows do not cross midnight).")
 
     allowed_days = normalize_days(args.days_of_week)
 
@@ -338,30 +384,33 @@ def main():
         raise ValueError("MaxDurationMinutes must be >= MinDurationMinutes.")
     if args.interval_seconds <= 0:
         raise ValueError("IntervalSeconds must be > 0.")
+    if args.progress_tick_seconds <= 0:
+        raise ValueError("progress-tick-seconds must be > 0.")
 
-    # Start no-lock immediately and keep it active for the life of this script.
+    # Always-on no-lock
     caffeinate_proc = start_caffeinate()
     atexit.register(lambda: stop_process(caffeinate_proc))
 
-    def handle_sigint(signum, frame):
-        print("\nInterrupted. Exiting.")
+    def handle_sig(*_):
+        clear_progress_line()
+        print("\nExiting.")
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, handle_sigint)
-    signal.signal(signal.SIGTERM, handle_sigint)
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
 
-    print("No-lock is active (caffeinate running).")
-    print("If F13 sending does not work, grant Accessibility and Automation permissions to your terminal app.")
+    print("No-lock active via caffeinate.")
+    print("If F13 does not work: allow your terminal in Privacy & Security -> Accessibility and Automation (System Events).")
 
     with RawTerminal():
-        # Immediate run on launch
-        run_session(args.min_duration_minutes, args.max_duration_minutes, args.interval_seconds)
+        # Immediate session on launch
+        run_session(args.min_duration_minutes, args.max_duration_minutes, args.interval_seconds, args.progress_tick_seconds)
 
-        # Schedule future sessions forever
+        # Then scheduled sessions forever
         while True:
             next_start = get_next_session_start(win_start, win_end, allowed_days)
-            wait_until(next_start)
-            run_session(args.min_duration_minutes, args.max_duration_minutes, args.interval_seconds)
+            wait_until(next_start, args.progress_tick_seconds)
+            run_session(args.min_duration_minutes, args.max_duration_minutes, args.interval_seconds, args.progress_tick_seconds)
 
 
 if __name__ == "__main__":
